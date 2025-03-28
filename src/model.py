@@ -5,7 +5,7 @@ from typing import List, Tuple
 import numpy as np
 import tensorflow as tf
 
-from dataloader_iam import Batch
+from src.dataloader_iam import Batch
 
 # Disable eager mode
 tf.compat.v1.disable_eager_execution()
@@ -17,6 +17,8 @@ class DecoderType:
     BeamSearch = 1
     WordBeamSearch = 2
 
+# added 2 important parameters , specified_model_path to point either to original model or 
+#fine-tuned arm model, and fine_tune to specify the training approach and avoid crashing the source code 
 
 class Model:
     """Minimalistic TF model for HTR."""
@@ -25,13 +27,17 @@ class Model:
                  char_list: List[str],
                  decoder_type: str = DecoderType.BestPath,
                  must_restore: bool = False,
-                 dump: bool = False) -> None:
+                 dump: bool = False,
+                 specified_model_path: str = '.model/',
+                 fine_tune: bool = False) -> None:
         """Init model: add CNN, RNN and CTC and initialize TF."""
         self.dump = dump
         self.char_list = char_list
         self.decoder_type = decoder_type
         self.must_restore = must_restore
         self.snap_ID = 0
+        self.model_dir = specified_model_path
+        self.fine_tune = fine_tune # this will help to decide what to do with the final layer - is essential because len(eng charlist) != len(arm charlist)
 
         # Whether to use normalization over a batch or a population
         self.is_train = tf.compat.v1.placeholder(tf.bool, name='is_train')
@@ -51,7 +57,7 @@ class Model:
             self.optimizer = tf.compat.v1.train.AdamOptimizer().minimize(self.loss)
 
         # initialize TF
-        self.sess, self.saver = self.setup_tf()
+        self.sess, self.saver = self.setup_tf(self.model_dir)
 
     def setup_cnn(self) -> None:
         """Create CNN layers."""
@@ -145,7 +151,11 @@ class Model:
             # the input to the decoder must have softmax already applied
             self.wbs_input = tf.nn.softmax(self.ctc_in_3d_tbc, axis=2)
 
-    def setup_tf(self) -> Tuple[tf.compat.v1.Session, tf.compat.v1.train.Saver]:
+
+
+
+    '''#minor change: added param model_dir to handle fine-tuning without ruining the original model
+    def setup_tf(self, model_dir = './model/' ) -> Tuple[tf.compat.v1.Session, tf.compat.v1.train.Saver]:
         """Initialize TF."""
         print('Python: ' + sys.version)
         print('Tensorflow: ' + tf.__version__)
@@ -153,7 +163,9 @@ class Model:
         sess = tf.compat.v1.Session()  # TF session
 
         saver = tf.compat.v1.train.Saver(max_to_keep=1)  # saver saves model to file
-        model_dir = '../model/'
+        #model_dir = './model/'
+        model_dir = os.path.abspath(model_dir)
+        print('[DEBUG] Looking for model in:', model_dir)
         latest_snapshot = tf.train.latest_checkpoint(model_dir)  # is there a saved model?
 
         # if model must be restored (for inference), there must be a snapshot
@@ -168,7 +180,44 @@ class Model:
             print('Init with new values')
             sess.run(tf.compat.v1.global_variables_initializer())
 
+        return sess, saver'''
+    
+    #minor change in init: added param model_dir to handle fine-tuning without ruining the original model
+    def setup_tf(self, model_dir = './model/') -> Tuple[tf.compat.v1.Session, tf.compat.v1.train.Saver]:
+        """Initialize TF."""
+        print('Python: ' + sys.version)
+        print('Tensorflow: ' + tf.__version__)
+
+        sess = tf.compat.v1.Session()  # TF session
+
+        model_dir = os.path.abspath(model_dir)
+        print('[DEBUG] Looking for model in:', model_dir)
+        latest_snapshot = tf.train.latest_checkpoint(model_dir)  # is there a saved model?
+
+        # central change: selectively restore vars if fine-tuning, last layer should be changed eng -> arm
+        if self.fine_tune:
+            to_restore = [v for v in tf.compat.v1.global_variables() if 'Variable_5' not in v.name]
+            saver = tf.compat.v1.train.Saver(var_list=to_restore, max_to_keep=1)
+        else:
+            saver = tf.compat.v1.train.Saver(max_to_keep=1)  # saver saves model to file
+
+        # if model must be restored (for inference), there must be a snapshot
+        if self.must_restore and not latest_snapshot:
+            raise Exception('No saved model found in: ' + model_dir)
+
+        # load saved model if available
+        if latest_snapshot:
+            print('Init with stored values from ' + latest_snapshot)
+            saver.restore(sess, latest_snapshot)
+            if self.fine_tune:
+                proj_vars = [v for v in tf.compat.v1.global_variables() if 'Variable_5' in v.name]
+                sess.run(tf.compat.v1.variables_initializer(proj_vars))
+        else:
+            print('Init with new values')
+            sess.run(tf.compat.v1.global_variables_initializer())
+
         return sess, saver
+
 
     def to_sparse(self, texts: List[str]) -> Tuple[List[List[int]], List[int], List[int]]:
         """Put ground truth texts into sparse tensor for ctc_loss."""
@@ -225,6 +274,22 @@ class Model:
         _, loss_val = self.sess.run(eval_list, feed_dict)
         self.batches_trained += 1
         return loss_val
+    
+    #change: added a new function to do forward pass and calculate the validation loss (no backward) 
+    def validate_batch(self, batch: Batch) -> float:
+        """Feed a batch into the NN to compute validation loss (no training)."""
+        num_batch_elements = len(batch.imgs)
+        max_text_len = batch.imgs[0].shape[0] // 4
+        sparse = self.to_sparse(batch.gt_texts)
+        feed_dict = {
+            self.input_imgs: batch.imgs,
+            self.gt_texts: sparse,
+            self.seq_len: [max_text_len] * num_batch_elements,
+            self.is_train: False
+        }
+        loss_val = self.sess.run(self.loss, feed_dict)
+        return loss_val
+
 
     @staticmethod
     def dump_nn_output(rnn_output: np.ndarray) -> None:
@@ -297,8 +362,11 @@ class Model:
             self.dump_nn_output(eval_res[1])
 
         return texts, probs
-
-    def save(self) -> None:
+    
+    #change: explicitly added a saving directory
+    def save(self, checkpoint_dir) -> None:
         """Save model to file."""
         self.snap_ID += 1
-        self.saver.save(self.sess, '../model/snapshot', global_step=self.snap_ID)
+        snapshot_path = os.path.join(checkpoint_dir, 'snapshot')
+        self.saver.save(self.sess, snapshot_path, global_step=self.snap_ID)
+

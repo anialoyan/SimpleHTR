@@ -6,9 +6,9 @@ import cv2
 import editdistance
 from path import Path
 
-from dataloader_iam import DataLoaderIAM, Batch
-from model import Model, DecoderType
-from preprocessor import Preprocessor
+from src.dataloader_iam import DataLoaderIAM, Batch
+from src.model import Model, DecoderType
+from src.preprocessor import Preprocessor
 
 
 class FilePaths:
@@ -99,8 +99,8 @@ def train(model: Model,
             print(f'No more improvement for {early_stopping} epochs. Training stopped.')
             break
 
-
-def validate(model: Model, loader: DataLoaderIAM, line_mode: bool) -> Tuple[float, float]:
+#minor change, making Dataloader loader instance functional for both IAM and ARM
+def validate(model: Model, loader, line_mode: bool) -> Tuple[float, float]:
     """Validates NN."""
     print('Validate NN')
     loader.validation_set()
